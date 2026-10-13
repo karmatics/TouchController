@@ -1,0 +1,11 @@
+{
+  "meta": "This file is managed locally, LLMs should not edit this file",
+  "main": [
+    "js/TouchController.js"
+  ],
+  "local": [],
+  "library": [
+    "UITools.js"
+  ],
+  "thirdParty": []
+}

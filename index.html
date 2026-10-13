@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>accuCad Touch Controller</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #121212; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; user-select: none; touch-action: none; }
+    #touch-container { width: 100%; height: 100%; position: relative; }
+  </style>
+  <script src="../Library/DomBasics.js" onerror="this.onerror=null; this.src='/Library/DomBasics.js';"></script>
+  <script src="../Library/UITools.js" onerror="this.onerror=null; this.src='/Library/UITools.js';"></script>
+  <script src="js/TouchController.js"></script>
+</head>
+<body>
+  <div id="touch-container"></div>
+  <script>
+    document.addEventListener("DOMContentLoaded", function() {
+      if (typeof DomBasics !== 'undefined' && typeof DomBasics.run === 'function') {
+        DomBasics.run();
+      }
+      const container = document.getElementById("touch-container") || document.body;
+      const app = new TouchController();
+      app.run({ container: container });
+    });
+  </script>
+</body>
+</html>
