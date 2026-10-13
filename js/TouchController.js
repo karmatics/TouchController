@@ -225,14 +225,10 @@ class TouchController {
       this._cleanupConnection();
       this._updateButtonState(true);
 
-      const customSignalServer = localStorage.getItem('accucad-custom-signal-server');
-      const SIGNAL_BASE = customSignalServer || 'https://ntfy.sh';
-      const signalTopic = `accucad-p2p-${roomCode}`;
-
       let currentHandledSid = null;
 
       const handleOfferPayload = async (envelope) => {
-        if (!envelope || envelope.from !== 'host' || !envelope.sdp) return;
+        if (!envelope || envelope.from !== 'host' || !envelope.sdp || envelope.room !== roomCode) return;
         if (envelope.sid === currentHandledSid && this.peerConnection) return;
 
         currentHandledSid = envelope.sid;
@@ -288,24 +284,22 @@ class TouchController {
           const answerMessage = {
             from: 'client',
             type: 'answer',
+            room: roomCode,
             sid: envelope.sid,
             sdp: pc.localDescription
           };
 
-          const sendAnswer = async () => {
+          const sendAnswer = () => {
             if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
               return;
             }
-            try {
-              await fetch(`${SIGNAL_BASE}/${signalTopic}`, {
-                method: 'POST',
-                body: JSON.stringify(answerMessage)
-              });
-              this._log('Posted answer to relay');
-            } catch (e) {}
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(answerMessage));
+              this._log('Posted answer via WebSocket relay');
+            }
           };
 
-          await sendAnswer();
+          sendAnswer();
 
           if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
           this.clientBeaconInterval = setInterval(() => {
@@ -314,7 +308,7 @@ class TouchController {
               return;
             }
             sendAnswer();
-          }, 2500);
+          }, 2000);
 
         } catch (err) {
           this._log(`Connection error: ${err.message}`);
@@ -323,76 +317,34 @@ class TouchController {
         }
       };
 
-      // Announce client presence so desktop sends offer immediately
-      const announcePresence = async () => {
-        try {
-          await fetch(`${SIGNAL_BASE}/${signalTopic}`, {
-            method: 'POST',
-            body: JSON.stringify({ from: 'client', type: 'client-ready', room: roomCode })
-          });
-          this._log('Announced client readiness');
-        } catch (e) {}
-      };
-      announcePresence();
+      // Connect to public WebSocket relay
+      const wsRelayUrl = `wss://socketsbay.com/wss/v2/1/demo/`;
+      let ws = null;
 
-      // Helper to extract nested JSON from ntfy SSE payload
-      const parseNtfyEvent = (eventData) => {
-        try {
-          const raw = JSON.parse(eventData);
-          if (raw.event === 'message' && raw.message) {
-            return typeof raw.message === 'string' ? JSON.parse(raw.message) : raw.message;
-          }
-          return typeof raw.message === 'string' ? JSON.parse(raw.message) : raw;
-        } catch (e) {
-          return null;
-        }
-      };
-
-      // Connect to SSE stream for instantaneous offer push
       try {
-        const sseUrl = `${SIGNAL_BASE}/${signalTopic}/sse`;
-        this._signalEventSource = new EventSource(sseUrl);
+        ws = new WebSocket(wsRelayUrl);
+        this._signalWebSocket = ws;
 
-        this._signalEventSource.onmessage = (event) => {
-          const payload = parseNtfyEvent(event.data);
-          if (payload && payload.from === 'host' && payload.type === 'offer') {
-            handleOfferPayload(payload);
-          }
+        ws.onopen = () => {
+          this._log('Connected to WebSocket relay');
+          ws.send(JSON.stringify({ from: 'client', type: 'client-ready', room: roomCode }));
         };
 
-        this._signalEventSource.onerror = () => {
-          // Re-announce on reconnect
-          announcePresence();
+        ws.onmessage = (e) => {
+          try {
+            const payload = JSON.parse(e.data);
+            if (payload && payload.room === roomCode && payload.from === 'host' && payload.type === 'offer') {
+              handleOfferPayload(payload);
+            }
+          } catch (err) {}
+        };
+
+        ws.onerror = (e) => {
+          this._log('WebSocket notice: reconnecting...');
         };
       } catch (err) {
-        this._log(`SSE stream error: ${err.message}`);
+        this._log(`WebSocket error: ${err.message}`);
       }
-
-      // Backup HTTP polling to guarantee connection if SSE is blocked on cellular
-      this.clientPollInterval = setInterval(async () => {
-        if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
-          clearInterval(this.clientPollInterval);
-          return;
-        }
-        try {
-          const res = await fetch(`${SIGNAL_BASE}/${signalTopic}/raw?poll=1&since=all`);
-          if (res.ok) {
-            const text = await res.text();
-            if (text && text.trim()) {
-              const lines = text.trim().split('\n');
-              for (let i = lines.length - 1; i >= 0; i--) {
-                try {
-                  const msg = JSON.parse(lines[i]);
-                  if (msg.from === 'host' && msg.type === 'offer') {
-                    handleOfferPayload(msg);
-                    break;
-                  }
-                } catch (e) {}
-              }
-            }
-          }
-        } catch (e) {}
-      }, 2500);
     }
     async _processManualOffer(offerBase64, answerTextArea, statusLabel) {
       if (this.peerConnection) return;
@@ -625,6 +577,11 @@ class TouchController {
     this.clientBeaconInterval = null;
     this.clientPollInterval = null;
     this.heartbeatInterval = null;
+
+    if (this._signalWebSocket) {
+      try { this._signalWebSocket.close(); } catch (e) {}
+      this._signalWebSocket = null;
+    }
 
     if (this._signalEventSource) {
       try { this._signalEventSource.close(); } catch (e) {}
