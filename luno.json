@@ -16,7 +16,7 @@
     "UITools.js"
   ],
   "styles": [],
-  "processedCountSinceCheckpoint": 0,
+  "processedCountSinceCheckpoint": 2,
   "changedMethods": {
     "luno.json": "2026-10-13T02:09:26.098Z",
     "index.html": "2026-10-13T02:09:26.098Z",
@@ -28,8 +28,10 @@
     "Luno/app/ClientAppUI.js": "2026-10-13T02:48:06.984Z",
     "Luno/app/LunoSpaDock.js": "2026-10-13T02:48:06.984Z",
     "Library/ThreeJSLoader.js": "2026-10-13T02:58:10.075Z",
-    "accuCad/js/ui/AccuDrawInput.js": "2026-10-13T02:58:10.075Z"
+    "accuCad/js/ui/AccuDrawInput.js": "2026-10-13T02:58:10.075Z",
+    "Library/DomBasics.js": "2026-10-13T03:16:09.201Z",
+    "Library/LunoLoader.js": "2026-10-13T03:16:09.201Z"
   },
-  "lastCheckpointTime": "2026-10-13T02:58:33.206Z",
+  "lastCheckpointTime": "2026-10-13T03:13:55.811Z",
   "pendingCheckpointDescription": "Clean working tree"
 }
