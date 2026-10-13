@@ -233,16 +233,17 @@ class TouchController {
 
       const handleOfferPayload = async (envelope) => {
         if (!envelope || envelope.from !== 'host' || !envelope.sdp) return;
-        if (envelope.sid === currentHandledSid) return;
+        if (envelope.sid === currentHandledSid && this.peerConnection) return;
 
         currentHandledSid = envelope.sid;
-        this._log(`Accepting offer for session: ${envelope.sid}`);
-        statusLabel.textContent = 'Formulating connection answer...';
+        this._log(`Accepting host offer for session: ${envelope.sid}`);
+        statusLabel.textContent = 'Negotiating connection...';
         statusLabel.style.color = '#0288d1';
 
         try {
           if (this.peerConnection) {
             try { this.peerConnection.close(); } catch (e) {}
+            this.peerConnection = null;
           }
 
           const pc = new RTCPeerConnection(this._getRTCConfig());
@@ -300,10 +301,10 @@ class TouchController {
                 method: 'POST',
                 body: JSON.stringify(answerMessage)
               });
+              this._log('Posted answer to relay');
             } catch (e) {}
           };
 
-          this._log('Posting answer to relay...');
           await sendAnswer();
 
           if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
@@ -322,13 +323,30 @@ class TouchController {
         }
       };
 
-      // Announce client readiness
-      try {
-        fetch(`${SIGNAL_BASE}/${signalTopic}`, {
-          method: 'POST',
-          body: JSON.stringify({ from: 'client', type: 'client-ready', room: roomCode })
-        }).catch(() => {});
-      } catch (e) {}
+      // Announce client presence so desktop sends offer immediately
+      const announcePresence = async () => {
+        try {
+          await fetch(`${SIGNAL_BASE}/${signalTopic}`, {
+            method: 'POST',
+            body: JSON.stringify({ from: 'client', type: 'client-ready', room: roomCode })
+          });
+          this._log('Announced client readiness');
+        } catch (e) {}
+      };
+      announcePresence();
+
+      // Helper to extract nested JSON from ntfy SSE payload
+      const parseNtfyEvent = (eventData) => {
+        try {
+          const raw = JSON.parse(eventData);
+          if (raw.event === 'message' && raw.message) {
+            return typeof raw.message === 'string' ? JSON.parse(raw.message) : raw.message;
+          }
+          return typeof raw.message === 'string' ? JSON.parse(raw.message) : raw;
+        } catch (e) {
+          return null;
+        }
+      };
 
       // Connect to SSE stream for instantaneous offer push
       try {
@@ -336,19 +354,21 @@ class TouchController {
         this._signalEventSource = new EventSource(sseUrl);
 
         this._signalEventSource.onmessage = (event) => {
-          try {
-            const raw = JSON.parse(event.data);
-            const payload = typeof raw.message === 'string' ? JSON.parse(raw.message) : raw;
-            if (payload && payload.from === 'host') {
-              handleOfferPayload(payload);
-            }
-          } catch (e) {}
+          const payload = parseNtfyEvent(event.data);
+          if (payload && payload.from === 'host' && payload.type === 'offer') {
+            handleOfferPayload(payload);
+          }
+        };
+
+        this._signalEventSource.onerror = () => {
+          // Re-announce on reconnect
+          announcePresence();
         };
       } catch (err) {
-        this._log(`SSE stream note: ${err.message}`);
+        this._log(`SSE stream error: ${err.message}`);
       }
 
-      // Backup HTTP poll every 2.5s
+      // Backup HTTP polling to guarantee connection if SSE is blocked on cellular
       this.clientPollInterval = setInterval(async () => {
         if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
           clearInterval(this.clientPollInterval);
