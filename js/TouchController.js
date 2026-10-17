@@ -217,135 +217,162 @@ class TouchController {
     }
 
     async _startWirelessClient(roomCode, statusLabel) {
-      this.roomCode = roomCode;
-      statusLabel.textContent = 'Searching for host...';
-      statusLabel.style.color = '#90a4ae';
-      this._log(`--- Connect attempt, room: ${roomCode} ---`);
+          this.roomCode = roomCode;
+          statusLabel.textContent = 'Searching for host...';
+          statusLabel.style.color = '#90a4ae';
+          this._log(`--- Connect attempt, room: ${roomCode} ---`);
 
-      this._cleanupConnection();
-      this._updateButtonState(true);
+          this._cleanupConnection();
+          this._updateButtonState(true);
 
-      let currentHandledSid = null;
+          let currentHandledSid = null;
 
-      const handleOfferPayload = async (envelope) => {
-        if (!envelope || envelope.from !== 'host' || !envelope.sdp || envelope.room !== roomCode) return;
-        if (envelope.sid === currentHandledSid && this.peerConnection) return;
-
-        currentHandledSid = envelope.sid;
-        this._log(`Accepting host offer for session: ${envelope.sid}`);
-        statusLabel.textContent = 'Negotiating connection...';
-        statusLabel.style.color = '#0288d1';
-
-        try {
-          if (this.peerConnection) {
-            try { this.peerConnection.close(); } catch (e) {}
-            this.peerConnection = null;
+          // Extract host IP parameter from URL or default to detected Mac LAN IP
+          const params = new URLSearchParams(window.location.search);
+          let hostIp = params.get('host') || window.location.hostname;
+          if (hostIp === 'localhost' || hostIp === '127.0.0.1') {
+            hostIp = '10.0.0.226';
           }
 
-          const pc = new RTCPeerConnection(this._getRTCConfig());
-          this.peerConnection = pc;
+          const localSignalEndpoint = `http://${hostIp}:3000/${roomCode}`;
+          const fallbackSignalEndpoint = `https://ntfy.sh/accucad-p2p-${roomCode}`;
 
-          pc.oniceconnectionstatechange = () => {
-            this._log(`ICE State: ${pc.iceConnectionState}`);
+          const broadcastAnswer = async (payload) => {
+            const bodyStr = JSON.stringify(payload);
+            try {
+              await fetch(localSignalEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: bodyStr
+              });
+            } catch (e) {}
+
+            try {
+              await fetch(fallbackSignalEndpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: bodyStr
+              });
+            } catch (e) {}
           };
 
-          pc.onconnectionstatechange = () => {
-            const state = pc.connectionState.toLowerCase();
-            this._log(`Connection state: ${state}`);
-            if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-              statusLabel.textContent = 'Disconnected. Retrying...';
-              statusLabel.style.color = '#ffa726';
-              this._cleanupConnection();
-              setTimeout(() => {
-                this._startWirelessClient(roomCode, statusLabel);
-              }, 1500);
-            } else if (state === 'connected') {
-              if (!this.isVerified) {
-                statusLabel.textContent = 'Transport established. Verifying...';
-                statusLabel.style.color = '#0288d1';
+          const handleOfferPayload = async (envelope) => {
+            if (!envelope || envelope.from !== 'host' || !envelope.sdp || envelope.room !== roomCode) return;
+            if (envelope.sid === currentHandledSid && this.peerConnection) return;
+
+            currentHandledSid = envelope.sid;
+            this._log(`Accepting host offer for session: ${envelope.sid}`);
+            statusLabel.textContent = 'Negotiating connection...';
+            statusLabel.style.color = '#0288d1';
+
+            try {
+              if (this.peerConnection) {
+                try { this.peerConnection.close(); } catch (e) {}
+                this.peerConnection = null;
               }
+
+              const pc = new RTCPeerConnection(this._getRTCConfig());
+              this.peerConnection = pc;
+
+              pc.oniceconnectionstatechange = () => {
+                this._log(`ICE State: ${pc.iceConnectionState}`);
+              };
+
+              pc.onconnectionstatechange = () => {
+                const state = pc.connectionState.toLowerCase();
+                this._log(`Connection state: ${state}`);
+                if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+                  statusLabel.textContent = 'Disconnected. Retrying...';
+                  statusLabel.style.color = '#ffa726';
+                  this._cleanupConnection();
+                  setTimeout(() => {
+                    this._startWirelessClient(roomCode, statusLabel);
+                  }, 1500);
+                } else if (state === 'connected') {
+                  if (!this.isVerified) {
+                    statusLabel.textContent = 'Transport established. Verifying...';
+                    statusLabel.style.color = '#0288d1';
+                  }
+                }
+              };
+
+              pc.ondatachannel = (e) => {
+                this._log('Data channel received from host');
+                this.dataChannel = e.channel;
+                this._setupDataChannelEvents(this.dataChannel, statusLabel);
+              };
+
+              await pc.setRemoteDescription(new RTCSessionDescription(envelope.sdp));
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+
+              statusLabel.textContent = 'Assembling routes...';
+              statusLabel.style.color = '#ffa726';
+              await this._waitForIceGathering(pc);
+
+              const answerMessage = {
+                from: 'client',
+                type: 'answer',
+                room: roomCode,
+                sid: envelope.sid,
+                sdp: pc.localDescription
+              };
+
+              broadcastAnswer(answerMessage);
+
+              if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
+              this.clientBeaconInterval = setInterval(() => {
+                if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
+                  clearInterval(this.clientBeaconInterval);
+                  this.clientBeaconInterval = null;
+                  return;
+                }
+                broadcastAnswer(answerMessage);
+              }, 1500);
+
+            } catch (err) {
+              this._log(`Connection error: ${err.message}`);
+              statusLabel.textContent = 'Error: ' + err.message;
+              statusLabel.style.color = '#ff4444';
             }
           };
 
-          pc.ondatachannel = (e) => {
-            this._log('Data channel received from host');
-            this.dataChannel = e.channel;
-            this._setupDataChannelEvents(this.dataChannel, statusLabel);
-          };
-
-          await pc.setRemoteDescription(new RTCSessionDescription(envelope.sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-
-          statusLabel.textContent = 'Assembling routes...';
-          statusLabel.style.color = '#ffa726';
-          await this._waitForIceGathering(pc);
-
-          const answerMessage = {
-            from: 'client',
-            type: 'answer',
-            room: roomCode,
-            sid: envelope.sid,
-            sdp: pc.localDescription
-          };
-
-          const sendAnswer = () => {
-            if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
-              return;
-            }
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify(answerMessage));
-              this._log('Posted answer via WebSocket relay');
-            }
-          };
-
-          sendAnswer();
-
-          if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
-          this.clientBeaconInterval = setInterval(() => {
-            if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
-              clearInterval(this.clientBeaconInterval);
-              return;
-            }
-            sendAnswer();
-          }, 2000);
-
-        } catch (err) {
-          this._log(`Connection error: ${err.message}`);
-          statusLabel.textContent = 'Error: ' + err.message;
-          statusLabel.style.color = '#ff4444';
-        }
-      };
-
-      // Connect to public WebSocket relay
-      const wsRelayUrl = `wss://socketsbay.com/wss/v2/1/demo/`;
-      let ws = null;
-
-      try {
-        ws = new WebSocket(wsRelayUrl);
-        this._signalWebSocket = ws;
-
-        ws.onopen = () => {
-          this._log('Connected to WebSocket relay');
-          ws.send(JSON.stringify({ from: 'client', type: 'client-ready', room: roomCode }));
-        };
-
-        ws.onmessage = (e) => {
+          // Connect SSE listener to local LAN relay
           try {
-            const payload = JSON.parse(e.data);
-            if (payload && payload.room === roomCode && payload.from === 'host' && payload.type === 'offer') {
-              handleOfferPayload(payload);
-            }
-          } catch (err) {}
-        };
+            const esLocal = new EventSource(localSignalEndpoint);
+            this._clientEventSourceLocal = esLocal;
 
-        ws.onerror = (e) => {
-          this._log('WebSocket notice: reconnecting...');
-        };
-      } catch (err) {
-        this._log(`WebSocket error: ${err.message}`);
-      }
-    }
+            esLocal.onmessage = (e) => {
+              try {
+                const raw = JSON.parse(e.data);
+                const data = (raw && raw.message) ? JSON.parse(raw.message) : raw;
+                handleOfferPayload(data);
+              } catch (err) {}
+            };
+
+            esLocal.onopen = () => {
+              this._log('Connected to local LAN signal server');
+              broadcastAnswer({ from: 'client', type: 'client-ready', room: roomCode });
+            };
+          } catch (err) {}
+
+          // Connect fallback SSE listener directly to ntfy.sh
+          try {
+            const esFallback = new EventSource(`${fallbackSignalEndpoint}/sse`);
+            this._clientEventSourceFallback = esFallback;
+
+            esFallback.onmessage = (e) => {
+              try {
+                const raw = JSON.parse(e.data);
+                const data = (raw && raw.message) ? JSON.parse(raw.message) : raw;
+                handleOfferPayload(data);
+              } catch (err) {}
+            };
+          } catch (err) {}
+
+          // Announce ready immediately
+          broadcastAnswer({ from: 'client', type: 'client-ready', room: roomCode });
+        }
     async _processManualOffer(offerBase64, answerTextArea, statusLabel) {
       if (this.peerConnection) return;
       statusLabel.textContent = 'Parsing manual offer...';
@@ -570,49 +597,28 @@ class TouchController {
   }
 
   _cleanupConnection() {
-    if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
-    if (this.clientPollInterval) clearInterval(this.clientPollInterval);
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-
-    this.clientBeaconInterval = null;
-    this.clientPollInterval = null;
-    this.heartbeatInterval = null;
-
-    if (this._signalWebSocket) {
-      try { this._signalWebSocket.close(); } catch (e) {}
-      this._signalWebSocket = null;
-    }
-
-    if (this._signalEventSource) {
-      try { this._signalEventSource.close(); } catch (e) {}
-      this._signalEventSource = null;
-    }
-
-    if (this.peerConnection) {
-      try { this.peerConnection.close(); } catch (e) {}
-      this.peerConnection = null;
-    }
-    this.dataChannel = null;
-    this.isVerified = false;
-    this._updateButtonState(false);
-
-    if (this.connectionWelcome) {
-      this.connectionWelcome.style.display = 'flex';
-      const welcomeStatus = document.getElementById('p2p-welcome-pairing-status');
-      if (welcomeStatus) {
-        welcomeStatus.textContent = 'Awaiting Host Synchronization...';
-        welcomeStatus.style.color = '#ffa726';
+      if (this._clientEventSourceLocal) {
+        try { this._clientEventSourceLocal.close(); } catch (e) {}
+        this._clientEventSourceLocal = null;
       }
+      if (this._clientEventSourceFallback) {
+        try { this._clientEventSourceFallback.close(); } catch (e) {}
+        this._clientEventSourceFallback = null;
+      }
+      if (this.clientBeaconInterval) {
+        clearInterval(this.clientBeaconInterval);
+        this.clientBeaconInterval = null;
+      }
+      if (this.dataChannel) {
+        try { this.dataChannel.close(); } catch (e) {}
+        this.dataChannel = null;
+      }
+      if (this.peerConnection) {
+        try { this.peerConnection.close(); } catch (e) {}
+        this.peerConnection = null;
+      }
+      this.isVerified = false;
     }
-    if (this.trackpadView) {
-      this.trackpadView.style.display = 'none';
-    }
-    if (this.trackpadControls) {
-      this.trackpadControls.style.display = 'none';
-    }
-
-    this.setPanelExpanded(true);
-  }
   _startHeartbeat(channel, statusLabel) {
       if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
       this.lastHeartbeatTime = Date.now();
@@ -727,288 +733,310 @@ class TouchController {
     }
 
   _initUI(parentElement, statusLabel) {
-    this.rootElement = makeElement('div', { id: 'touch-app-container' });
+      this.rootElement = makeElement('div', { id: 'touch-app-container' });
 
-    // View Trackpad
-    this.trackpadView = makeElement('div', { className: 'trackpad-view', style: { display: 'none' } });
-    const svgView = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    const gridGroupView = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    gridGroupView.setAttribute('opacity', '0.07');
+      // View Trackpad
+      this.trackpadView = makeElement('div', { className: 'trackpad-view', style: { display: 'none' } });
+      const svgView = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      const gridGroupView = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      gridGroupView.setAttribute('opacity', '0.07');
 
-    const horizontalLineV = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    horizontalLineV.setAttribute('x1', '0'); horizontalLineV.setAttribute('y1', '50%');
-    horizontalLineV.setAttribute('x2', '100%'); horizontalLineV.setAttribute('y2', '50%');
-    horizontalLineV.setAttribute('stroke', '#ffffff'); horizontalLineV.setAttribute('stroke-width', '1.5');
-    horizontalLineV.setAttribute('stroke-dasharray', '4,4');
+      const horizontalLineV = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      horizontalLineV.setAttribute('x1', '0'); horizontalLineV.setAttribute('y1', '50%');
+      horizontalLineV.setAttribute('x2', '100%'); horizontalLineV.setAttribute('y2', '50%');
+      horizontalLineV.setAttribute('stroke', '#ffffff'); horizontalLineV.setAttribute('stroke-width', '1.5');
+      horizontalLineV.setAttribute('stroke-dasharray', '4,4');
 
-    const verticalLineV = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    verticalLineV.setAttribute('x1', '50%'); verticalLineV.setAttribute('y1', '0');
-    verticalLineV.setAttribute('x2', '50%'); verticalLineV.setAttribute('y2', '100%');
-    verticalLineV.setAttribute('stroke', '#ffffff'); verticalLineV.setAttribute('stroke-width', '1.5');
-    verticalLineV.setAttribute('stroke-dasharray', '4,4');
+      const verticalLineV = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      verticalLineV.setAttribute('x1', '50%'); verticalLineV.setAttribute('y1', '0');
+      verticalLineV.setAttribute('x2', '50%'); verticalLineV.setAttribute('y2', '100%');
+      verticalLineV.setAttribute('stroke', '#ffffff'); verticalLineV.setAttribute('stroke-width', '1.5');
+      verticalLineV.setAttribute('stroke-dasharray', '4,4');
 
-    gridGroupView.appendChild(horizontalLineV);
-    gridGroupView.appendChild(verticalLineV);
-    svgView.appendChild(gridGroupView);
-    this.trackpadView.appendChild(svgView);
+      gridGroupView.appendChild(horizontalLineV);
+      gridGroupView.appendChild(verticalLineV);
+      svgView.appendChild(gridGroupView);
+      this.trackpadView.appendChild(svgView);
 
-    this.viewStatusText = makeElement('div', { className: 'status-text' }, 'VIEW: ROTATE');
-    this.trackpadView.appendChild(this.viewStatusText);
+      this.viewStatusText = makeElement('div', { className: 'status-text' }, 'VIEW: ROTATE');
+      this.trackpadView.appendChild(this.viewStatusText);
 
-    // Controls Trackpad
-    this.trackpadControls = makeElement('div', { className: 'trackpad-controls', style: { display: 'none' } });
-    const svgCtrl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    const gridGroupCtrl = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-    gridGroupCtrl.setAttribute('opacity', '0.07');
+      // Controls Trackpad
+      this.trackpadControls = makeElement('div', { className: 'trackpad-controls', style: { display: 'none' } });
+      const svgCtrl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      const gridGroupCtrl = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      gridGroupCtrl.setAttribute('opacity', '0.07');
 
-    const horizontalLineC = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    horizontalLineC.setAttribute('x1', '0'); horizontalLineC.setAttribute('y1', '50%');
-    horizontalLineC.setAttribute('x2', '100%'); horizontalLineC.setAttribute('y2', '50%');
-    horizontalLineC.setAttribute('stroke', '#ffffff'); horizontalLineC.setAttribute('stroke-width', '1.5');
-    horizontalLineC.setAttribute('stroke-dasharray', '4,4');
+      const horizontalLineC = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      horizontalLineC.setAttribute('x1', '0'); horizontalLineC.setAttribute('y1', '50%');
+      horizontalLineC.setAttribute('x2', '100%'); horizontalLineC.setAttribute('y2', '50%');
+      horizontalLineC.setAttribute('stroke', '#ffffff'); horizontalLineC.setAttribute('stroke-width', '1.5');
+      horizontalLineC.setAttribute('stroke-dasharray', '4,4');
 
-    const verticalLineC = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-    verticalLineC.setAttribute('x1', '50%'); verticalLineC.setAttribute('y1', '0');
-    verticalLineC.setAttribute('x2', '50%'); verticalLineC.setAttribute('y2', '100%');
-    verticalLineC.setAttribute('stroke', '#ffffff'); verticalLineC.setAttribute('stroke-width', '1.5');
-    verticalLineC.setAttribute('stroke-dasharray', '4,4');
+      const verticalLineC = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      verticalLineC.setAttribute('x1', '50%'); verticalLineC.setAttribute('y1', '0');
+      verticalLineC.setAttribute('x2', '50%'); verticalLineC.setAttribute('y2', '100%');
+      verticalLineC.setAttribute('stroke', '#ffffff'); verticalLineC.setAttribute('stroke-width', '1.5');
+      verticalLineC.setAttribute('stroke-dasharray', '4,4');
 
-    gridGroupCtrl.appendChild(horizontalLineC);
-    gridGroupCtrl.appendChild(verticalLineC);
-    svgCtrl.appendChild(gridGroupCtrl);
-    this.trackpadControls.appendChild(svgCtrl);
+      gridGroupCtrl.appendChild(horizontalLineC);
+      gridGroupCtrl.appendChild(verticalLineC);
+      svgCtrl.appendChild(gridGroupCtrl);
+      this.trackpadControls.appendChild(svgCtrl);
 
-    this.ctrlStatusText = makeElement('div', { className: 'status-text' }, 'CONTROLS: COMPASS');
-    this.trackpadControls.appendChild(this.ctrlStatusText);
+      this.ctrlStatusText = makeElement('div', { className: 'status-text' }, 'CONTROLS: COMPASS');
+      this.trackpadControls.appendChild(this.ctrlStatusText);
 
-    // Connection instructions card shown while awaiting link
-    this.connectionWelcome = makeElement('div', {
-      id: 'p2p-connection-welcome-card',
-      style: {
-        position: 'absolute',
-        top: '55%',
-        left: '50%',
-        transform: 'translate(-50%, -50%)',
-        textAlign: 'center',
-        color: '#e0e0e0',
-        fontFamily: 'sans-serif',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        gap: '12px',
-        padding: '24px',
-        background: 'rgba(25, 25, 25, 0.95)',
-        borderRadius: '10px',
-        border: '1px dashed #444',
-        zIndex: '100',
-        width: '85%',
-        maxWidth: '310px',
-        boxSizing: 'border-box',
-        boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
-      }
-    }, [
-      makeElement('div', { style: { fontSize: '18px', fontWeight: 'bold', color: '#00e676', letterSpacing: '0.5px' } }, 'Touch Controller'),
-      makeElement('div', { style: { fontSize: '12px', color: '#888', lineHeight: '1.4', margin: '4px 0 10px' } }, 'Scan the QR code displayed in accuCad to pair instantly, or enter the matching Room Code below.'),
-      makeElement('div', { id: 'p2p-welcome-pairing-status', style: { fontSize: '11px', color: '#ffa726', fontWeight: 'bold', background: 'rgba(255,167,38,0.08)', padding: '6px 12px', borderRadius: '4px', border: '1px solid rgba(255,167,38,0.2)' } }, 'Awaiting Host Synchronization...')
-    ]);
+      // Connection instructions card shown while awaiting link
+      this.connectionWelcome = makeElement('div', {
+        id: 'p2p-connection-welcome-card',
+        style: {
+          position: 'absolute',
+          top: '55%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          textAlign: 'center',
+          color: '#e0e0e0',
+          fontFamily: 'sans-serif',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: '12px',
+          padding: '24px',
+          background: 'rgba(25, 25, 25, 0.95)',
+          borderRadius: '10px',
+          border: '1px dashed #444',
+          zIndex: '100',
+          width: '85%',
+          maxWidth: '310px',
+          boxSizing: 'border-box',
+          boxShadow: '0 10px 30px rgba(0,0,0,0.6)'
+        }
+      }, [
+        makeElement('div', { style: { fontSize: '18px', fontWeight: 'bold', color: '#00e676', letterSpacing: '0.5px' } }, 'Touch Controller'),
+        makeElement('div', { style: { fontSize: '12px', color: '#888', lineHeight: '1.4', margin: '4px 0 10px' } }, 'Scan the QR code displayed in accuCad to pair instantly, or enter the matching Room Code below.'),
+        makeElement('div', { id: 'p2p-welcome-pairing-status', style: { fontSize: '11px', color: '#ffa726', fontWeight: 'bold', background: 'rgba(255,167,38,0.08)', padding: '6px 12px', borderRadius: '4px', border: '1px solid rgba(255,167,38,0.2)' } }, 'Awaiting Host Synchronization...')
+      ]);
 
-    this.rootElement.appendChild(this.connectionWelcome);
-    this.rootElement.appendChild(this.trackpadControls);
-    this.rootElement.appendChild(this.trackpadView);
+      this.rootElement.appendChild(this.connectionWelcome);
+      this.rootElement.appendChild(this.trackpadControls);
+      this.rootElement.appendChild(this.trackpadView);
 
-    // Expandable connection panel
-    this.p2pPanel = makeElement('div', { className: 'p2p-panel-card' });
+      // Expandable connection panel
+      this.p2pPanel = makeElement('div', { className: 'p2p-panel-card' });
 
-    this.p2pTriggerBtn = makeElement('button', {
-      style: {
-        position: 'absolute',
-        top: '0',
-        left: '0',
-        width: '100%',
-        height: '100%',
-        border: 'none',
-        background: 'transparent',
-        color: '#00e676',
-        fontFamily: 'monospace',
-        fontSize: '11px',
-        fontWeight: 'bold',
-        cursor: 'pointer',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: '510'
-      },
-      onclick: (e) => {
-        e.stopPropagation();
-        this.setPanelExpanded(!this.p2pExpanded);
-      }
-    }, 'P2P');
+      this.p2pTriggerBtn = makeElement('button', {
+        style: {
+          position: 'absolute',
+          top: '0',
+          left: '0',
+          width: '100%',
+          height: '100%',
+          border: 'none',
+          background: 'transparent',
+          color: '#00e676',
+          fontFamily: 'monospace',
+          fontSize: '11px',
+          fontWeight: 'bold',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: '510'
+        },
+        onclick: (e) => {
+          e.stopPropagation();
+          this.setPanelExpanded(!this.p2pExpanded);
+        }
+      }, 'P2P');
 
-    this.p2pCloseBtn = makeElement('button', {
-      style: {
-        position: 'absolute',
-        top: '6px',
-        right: '6px',
-        width: '24px',
-        height: '24px',
-        border: 'none',
-        background: 'transparent',
-        color: '#e53935',
-        fontFamily: 'monospace',
-        fontSize: '16px',
-        fontWeight: 'bold',
-        cursor: 'pointer',
-        display: 'none',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: '520'
-      },
-      onclick: (e) => {
-        e.stopPropagation();
-        this.setPanelExpanded(false);
-      }
-    }, '✕');
+      this.p2pCloseBtn = makeElement('button', {
+        style: {
+          position: 'absolute',
+          top: '6px',
+          right: '6px',
+          width: '24px',
+          height: '24px',
+          border: 'none',
+          background: 'transparent',
+          color: '#e53935',
+          fontFamily: 'monospace',
+          fontSize: '16px',
+          fontWeight: 'bold',
+          cursor: 'pointer',
+          display: 'none',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: '520'
+        },
+        onclick: (e) => {
+          e.stopPropagation();
+          this.setPanelExpanded(false);
+        }
+      }, '✕');
 
-    this.p2pPanelContents = makeElement('div', {
-      style: { display: 'none', marginTop: '30px', flexDirection: 'column', gap: '8px' }
-    });
+      this.p2pPanelContents = makeElement('div', {
+        style: { display: 'none', marginTop: '30px', flexDirection: 'column', gap: '8px' }
+      });
 
-    const header = makeElement('div', {
-      style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }
-    });
-    const title = makeElement('span', { style: { fontWeight: 'bold', color: '#00e676', fontSize: '11px' } }, 'P2P Link');
-    header.appendChild(title);
-    header.appendChild(statusLabel);
+      const header = makeElement('div', {
+        style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }
+      });
+      const title = makeElement('span', { style: { fontWeight: 'bold', color: '#00e676', fontSize: '11px' } }, 'P2P Link');
+      header.appendChild(title);
+      header.appendChild(statusLabel);
 
-    const syncRow = makeElement('div', { style: { display: 'flex', gap: '6px' } });
-    const roomInput = makeElement('input', {
-      placeholder: 'Code',
-      value: localStorage.getItem('p2p-client-room') || '7777',
-      style: {
-        width: '60px',
-        padding: '4px',
-        background: '#1a1a1a',
-        border: '1px solid #444',
-        color: '#fff',
-        borderRadius: '4px',
-        textAlign: 'center',
-        fontSize: '11px'
-      }
-    });
-    const connectBtn = makeElement('button', {
-      style: {
-        flex: '1',
-        padding: '4px',
-        border: 'none',
-        borderRadius: '4px',
-        fontWeight: 'bold',
-        cursor: 'pointer',
-        fontSize: '11px',
-        transition: 'all 0.15s'
-      }
-    });
-    this.connectBtn = connectBtn;
-    this._updateButtonState(false);
+      const syncRow = makeElement('div', { style: { display: 'flex', gap: '6px' } });
+      const roomInput = makeElement('input', {
+        placeholder: 'Code',
+        value: localStorage.getItem('p2p-client-room') || '7777',
+        style: {
+          width: '60px',
+          padding: '4px',
+          background: '#1a1a1a',
+          border: '1px solid #444',
+          color: '#fff',
+          borderRadius: '4px',
+          textAlign: 'center',
+          fontSize: '11px'
+        }
+      });
+      const connectBtn = makeElement('button', {
+        style: {
+          flex: '1',
+          padding: '4px',
+          border: 'none',
+          borderRadius: '4px',
+          fontWeight: 'bold',
+          cursor: 'pointer',
+          fontSize: '11px',
+          transition: 'all 0.15s'
+        }
+      });
+      this.connectBtn = connectBtn;
+      this._updateButtonState(false);
 
-    syncRow.appendChild(roomInput);
-    syncRow.appendChild(connectBtn);
+      syncRow.appendChild(roomInput);
+      syncRow.appendChild(connectBtn);
 
-    const reloadBtn = makeElement('button', {
-      style: {
-        width: '100%',
-        padding: '4px',
-        background: '#333',
-        color: '#ccc',
-        border: '1px solid #444',
-        borderRadius: '4px',
-        fontSize: '10px',
-        fontWeight: 'bold',
-        cursor: 'pointer'
-      }
-    }, 'Reload App');
+      const actionRow = makeElement('div', { style: { display: 'flex', gap: '6px' } });
 
-    this.p2pPanelContents.appendChild(header);
-    this.p2pPanelContents.appendChild(syncRow);
-    this.p2pPanelContents.appendChild(reloadBtn);
+      const reloadBtn = makeElement('button', {
+        style: {
+          flex: '1',
+          padding: '4px',
+          background: '#333',
+          color: '#ccc',
+          border: '1px solid #444',
+          borderRadius: '4px',
+          fontSize: '10px',
+          fontWeight: 'bold',
+          cursor: 'pointer'
+        }
+      }, 'Reload App');
 
-    this.debugLog = makeElement('div', {
-      style: {
-        background: 'rgba(10, 10, 10, 0.9)',
-        padding: '6px',
-        overflowY: 'scroll',
-        fontFamily: 'monospace',
-        fontSize: '9px',
-        color: '#00e676',
-        boxSizing: 'border-box',
-        display: 'none'
-      }
-    });
+      const docsBtn = makeElement('button', {
+        style: {
+          flex: '1',
+          padding: '4px',
+          background: '#1e1430',
+          color: '#c084fc',
+          border: '1px solid #8b5cf6',
+          borderRadius: '4px',
+          fontSize: '10px',
+          fontWeight: 'bold',
+          cursor: 'pointer'
+        },
+        onclick: () => {
+          window.open('docs.html', '_blank');
+        }
+      }, 'Docs 📖');
 
-    this.p2pPanel.appendChild(this.p2pTriggerBtn);
-    this.p2pPanel.appendChild(this.p2pCloseBtn);
-    this.p2pPanel.appendChild(this.p2pPanelContents);
-    this.p2pPanel.appendChild(this.debugLog);
+      actionRow.appendChild(reloadBtn);
+      actionRow.appendChild(docsBtn);
 
-    this.rootElement.appendChild(this.p2pPanel);
+      this.p2pPanelContents.appendChild(header);
+      this.p2pPanelContents.appendChild(syncRow);
+      this.p2pPanelContents.appendChild(actionRow);
 
-    const fullscreenBtn = makeElement('div', {
-      style: {
-        position: 'absolute',
-        top: '12px',
-        right: '12px',
-        width: '36px',
-        height: '36px',
-        background: 'rgba(25,25,25,0.85)',
-        border: '1.5px solid #333',
-        borderRadius: '50%',
-        color: '#00e676',
-        fontSize: '18px',
-        textAlign: 'center',
-        lineHeight: '34px',
-        zIndex: '300',
-        cursor: 'pointer',
-        userSelect: 'none',
-        boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
-        boxSizing: 'border-box'
-      }
-    }, '⛶');
+      this.debugLog = makeElement('div', {
+        style: {
+          background: 'rgba(10, 10, 10, 0.9)',
+          padding: '6px',
+          overflowY: 'scroll',
+          fontFamily: 'monospace',
+          fontSize: '9px',
+          color: '#00e676',
+          boxSizing: 'border-box',
+          display: 'none'
+        }
+      });
 
-    fullscreenBtn.onclick = () => {
-      if (!document.fullscreenElement) {
-        document.documentElement.requestFullscreen()
-          .then(() => { fullscreenBtn.textContent = '✕'; })
-          .catch((err) => { console.warn("Fullscreen failed:", err); });
-      } else {
-        document.exitFullscreen();
-        fullscreenBtn.textContent = '⛶';
-      }
-    };
+      this.p2pPanel.appendChild(this.p2pTriggerBtn);
+      this.p2pPanel.appendChild(this.p2pCloseBtn);
+      this.p2pPanel.appendChild(this.p2pPanelContents);
+      this.p2pPanel.appendChild(this.debugLog);
 
-    this.rootElement.appendChild(fullscreenBtn);
-    parentElement.appendChild(this.rootElement);
+      this.rootElement.appendChild(this.p2pPanel);
 
-    this.p2pExpanded = false;
-    this.setPanelExpanded(false);
+      const fullscreenBtn = makeElement('div', {
+        style: {
+          position: 'absolute',
+          top: '12px',
+          right: '12px',
+          width: '36px',
+          height: '36px',
+          background: 'rgba(25,25,25,0.85)',
+          border: '1.5px solid #333',
+          borderRadius: '50%',
+          color: '#00e676',
+          fontSize: '18px',
+          textAlign: 'center',
+          lineHeight: '34px',
+          zIndex: '300',
+          cursor: 'pointer',
+          userSelect: 'none',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.4)',
+          boxSizing: 'border-box'
+        }
+      }, '⛶');
 
-    connectBtn.onclick = () => {
-      if (this.peerConnection || this.clientPollInterval) {
-        this._cleanupConnection();
-        statusLabel.textContent = 'Offline';
-        statusLabel.style.color = '#888';
-      } else {
-        const code = roomInput.value.trim();
-        if (!code) return;
-        localStorage.setItem('p2p-client-room', code);
-        this._startWirelessClient(code, statusLabel);
-      }
-    };
+      fullscreenBtn.onclick = () => {
+        if (!document.fullscreenElement) {
+          document.documentElement.requestFullscreen()
+            .then(() => { fullscreenBtn.textContent = '✕'; })
+            .catch((err) => { console.warn("Fullscreen failed:", err); });
+        } else {
+          document.exitFullscreen();
+          fullscreenBtn.textContent = '⛶';
+        }
+      };
 
-    reloadBtn.onclick = () => {
-      const url = new URL(window.location.href);
-      url.searchParams.set('t', Date.now().toString());
-      window.location.replace(url.toString());
-    };
-  }
+      this.rootElement.appendChild(fullscreenBtn);
+      parentElement.appendChild(this.rootElement);
+
+      this.p2pExpanded = false;
+      this.setPanelExpanded(false);
+
+      connectBtn.onclick = () => {
+        if (this.peerConnection || this.clientPollInterval) {
+          this._cleanupConnection();
+          statusLabel.textContent = 'Offline';
+          statusLabel.style.color = '#888';
+        } else {
+          const code = roomInput.value.trim();
+          if (!code) return;
+          localStorage.setItem('p2p-client-room', code);
+          this._startWirelessClient(code, statusLabel);
+        }
+      };
+
+      reloadBtn.onclick = () => {
+        const url = new URL(window.location.href);
+        url.searchParams.set('t', Date.now().toString());
+        window.location.replace(url.toString());
+      };
+    }
   _applyModeChange() {
       const modes = ['rotate', 'pan', 'sliders'];
       modes.forEach((m) => {
