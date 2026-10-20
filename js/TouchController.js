@@ -179,7 +179,7 @@ class TouchController {
     }
 
     sendDrag(dx, dy) {
-      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      if (this.dataChannel && (this.dataChannel.open || this.dataChannel.readyState === 'open')) {
         this.dataChannel.send(JSON.stringify({
           type: 'drag',
           dx: dx,
@@ -188,12 +188,12 @@ class TouchController {
         }));
       }
       if (this.statusText) {
-        this.statusText.textContent = `${this.currentMode.toUpperCase()} active: dx=${Math.round(dx)}, dy=${Math.round(dy)}`;
+        this.statusText.textContent = `${this.currentMode.toUpperCase()}: dx=${Math.round(dx)}, dy=${Math.round(dy)}`;
       }
     }
 
     sendZoom(ratio) {
-      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      if (this.dataChannel && (this.dataChannel.open || this.dataChannel.readyState === 'open')) {
         this.dataChannel.send(JSON.stringify({
           type: 'zoom',
           ratio: ratio
@@ -205,7 +205,7 @@ class TouchController {
     }
 
     sendDragRelease() {
-      if (this.dataChannel && this.dataChannel.readyState === 'open') {
+      if (this.dataChannel && (this.dataChannel.open || this.dataChannel.readyState === 'open')) {
         this.dataChannel.send(JSON.stringify({
           type: 'dragEnd',
           mode: this.currentMode
@@ -215,164 +215,135 @@ class TouchController {
         this.statusText.textContent = 'Drag surface ready.';
       }
     }
+    _startWirelessClient(roomCode, statusLabel) {
+      this.roomCode = roomCode;
+      statusLabel.textContent = 'Connecting via PeerJS broker...';
+      statusLabel.style.color = '#38bdf8';
+      this._log(`Starting PeerJS client for room [${roomCode}]`);
 
-    async _startWirelessClient(roomCode, statusLabel) {
-          this.roomCode = roomCode;
-          statusLabel.textContent = 'Searching for host...';
-          statusLabel.style.color = '#90a4ae';
-          this._log(`--- Connect attempt, room: ${roomCode} ---`);
+      this._cleanupConnection();
+      this._updateButtonState(true);
 
-          this._cleanupConnection();
-          this._updateButtonState(true);
+      // Load PeerJS dynamically from CDN
+      const loadPeerJS = async () => {
+        if (typeof globalThis.Peer !== 'undefined') return globalThis.Peer;
+        return new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
+          s.onload = () => resolve(globalThis.Peer);
+          s.onerror = () => {
+            const s2 = document.createElement('script');
+            s2.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';
+            s2.onload = () => resolve(globalThis.Peer);
+            s2.onerror = reject;
+            document.head.appendChild(s2);
+          };
+          document.head.appendChild(s);
+        });
+      };
 
-          let currentHandledSid = null;
-
-          // Extract host IP parameter from URL or default to detected Mac LAN IP
-          const params = new URLSearchParams(window.location.search);
-          let hostIp = params.get('host') || window.location.hostname;
-          if (hostIp === 'localhost' || hostIp === '127.0.0.1') {
-            hostIp = '10.0.0.226';
+      loadPeerJS().then((PeerClass) => {
+        const peer = new PeerClass({
+          debug: 1,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' }
+            ]
           }
+        });
+        this.peerConnection = peer;
 
-          const localSignalEndpoint = `http://${hostIp}:3000/${roomCode}`;
-          const fallbackSignalEndpoint = `https://ntfy.sh/accucad-p2p-${roomCode}`;
+        peer.on('open', (clientId) => {
+          this._log(`Mobile client peer opened with ID: ${clientId}`);
+          statusLabel.textContent = 'Calling workstation...';
+          statusLabel.style.color = '#f59e0b';
 
-          const broadcastAnswer = async (payload) => {
-            const bodyStr = JSON.stringify(payload);
-            try {
-              await fetch(localSignalEndpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: bodyStr
-              });
-            } catch (e) {}
+          const targetHostId = roomCode.startsWith('cad_') ? roomCode : `cad_${roomCode}`;
+          this._log(`Initiating DataChannel connection to [${targetHostId}]`);
+          const conn = peer.connect(targetHostId, { reliable: true });
 
-            try {
-              await fetch(fallbackSignalEndpoint, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: bodyStr
-              });
-            } catch (e) {}
-          };
+          conn.on('open', () => {
+            this._log('DataChannel opened successfully to host!');
+            this.dataChannel = conn;
+            this.isVerified = true;
 
-          const handleOfferPayload = async (envelope) => {
-            if (!envelope || envelope.from !== 'host' || !envelope.sdp || envelope.room !== roomCode) return;
-            if (envelope.sid === currentHandledSid && this.peerConnection) return;
+            statusLabel.textContent = 'Connected';
+            statusLabel.style.color = '#10b981';
 
-            currentHandledSid = envelope.sid;
-            this._log(`Accepting host offer for session: ${envelope.sid}`);
-            statusLabel.textContent = 'Negotiating connection...';
-            statusLabel.style.color = '#0288d1';
-
-            try {
-              if (this.peerConnection) {
-                try { this.peerConnection.close(); } catch (e) {}
-                this.peerConnection = null;
-              }
-
-              const pc = new RTCPeerConnection(this._getRTCConfig());
-              this.peerConnection = pc;
-
-              pc.oniceconnectionstatechange = () => {
-                this._log(`ICE State: ${pc.iceConnectionState}`);
-              };
-
-              pc.onconnectionstatechange = () => {
-                const state = pc.connectionState.toLowerCase();
-                this._log(`Connection state: ${state}`);
-                if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-                  statusLabel.textContent = 'Disconnected. Retrying...';
-                  statusLabel.style.color = '#ffa726';
-                  this._cleanupConnection();
-                  setTimeout(() => {
-                    this._startWirelessClient(roomCode, statusLabel);
-                  }, 1500);
-                } else if (state === 'connected') {
-                  if (!this.isVerified) {
-                    statusLabel.textContent = 'Transport established. Verifying...';
-                    statusLabel.style.color = '#0288d1';
-                  }
-                }
-              };
-
-              pc.ondatachannel = (e) => {
-                this._log('Data channel received from host');
-                this.dataChannel = e.channel;
-                this._setupDataChannelEvents(this.dataChannel, statusLabel);
-              };
-
-              await pc.setRemoteDescription(new RTCSessionDescription(envelope.sdp));
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-
-              statusLabel.textContent = 'Assembling routes...';
-              statusLabel.style.color = '#ffa726';
-              await this._waitForIceGathering(pc);
-
-              const answerMessage = {
-                from: 'client',
-                type: 'answer',
-                room: roomCode,
-                sid: envelope.sid,
-                sdp: pc.localDescription
-              };
-
-              broadcastAnswer(answerMessage);
-
-              if (this.clientBeaconInterval) clearInterval(this.clientBeaconInterval);
-              this.clientBeaconInterval = setInterval(() => {
-                if (this.dataChannel && this.dataChannel.readyState === 'open' && this.isVerified) {
-                  clearInterval(this.clientBeaconInterval);
-                  this.clientBeaconInterval = null;
-                  return;
-                }
-                broadcastAnswer(answerMessage);
-              }, 1500);
-
-            } catch (err) {
-              this._log(`Connection error: ${err.message}`);
-              statusLabel.textContent = 'Error: ' + err.message;
-              statusLabel.style.color = '#ff4444';
+            const welcomeStatus = document.getElementById('p2p-welcome-pairing-status');
+            if (welcomeStatus) {
+              welcomeStatus.textContent = '✓ Workstation Paired!';
+              welcomeStatus.style.color = '#10b981';
             }
-          };
 
-          // Connect SSE listener to local LAN relay
-          try {
-            const esLocal = new EventSource(localSignalEndpoint);
-            this._clientEventSourceLocal = esLocal;
+            // Hide connection panel automatically on successful pairing
+            this.setPanelExpanded(false);
 
-            esLocal.onmessage = (e) => {
-              try {
-                const raw = JSON.parse(e.data);
-                const data = (raw && raw.message) ? JSON.parse(raw.message) : raw;
-                handleOfferPayload(data);
-              } catch (err) {}
-            };
+            // Notify host that mobile is online
+            conn.send(JSON.stringify({ type: 'h-pong' }));
+            this._startHeartbeat(conn, statusLabel);
+          });
 
-            esLocal.onopen = () => {
-              this._log('Connected to local LAN signal server');
-              broadcastAnswer({ from: 'client', type: 'client-ready', room: roomCode });
-            };
-          } catch (err) {}
+          conn.on('data', (raw) => {
+            try {
+              const payload = typeof raw === 'string' ? JSON.parse(raw) : raw;
+              this.lastHeartbeatTime = Date.now();
 
-          // Connect fallback SSE listener directly to ntfy.sh
-          try {
-            const esFallback = new EventSource(`${fallbackSignalEndpoint}/sse`);
-            this._clientEventSourceFallback = esFallback;
+              if (payload.type === 'configure' && payload.config) {
+                this._applyAppConfiguration(payload.config);
+              } else if (payload.type === 'h-verified') {
+                this.isVerified = true;
+                statusLabel.textContent = 'Connected';
+                statusLabel.style.color = '#10b981';
+              }
+            } catch (err) {
+              console.error('[TouchController] Incoming parse error:', err);
+            }
+          });
 
-            esFallback.onmessage = (e) => {
-              try {
-                const raw = JSON.parse(e.data);
-                const data = (raw && raw.message) ? JSON.parse(raw.message) : raw;
-                handleOfferPayload(data);
-              } catch (err) {}
-            };
-          } catch (err) {}
+          conn.on('close', () => {
+            this._log('DataChannel closed by host.');
+            statusLabel.textContent = 'Disconnected. Retrying...';
+            statusLabel.style.color = '#f59e0b';
+            this._cleanupConnection();
+            setTimeout(() => {
+              this._startWirelessClient(roomCode, statusLabel);
+            }, 2000);
+          });
 
-          // Announce ready immediately
-          broadcastAnswer({ from: 'client', type: 'client-ready', room: roomCode });
-        }
+          conn.on('error', (err) => {
+            this._log(`Connection error: ${err.message || err}`);
+            statusLabel.textContent = 'Connection error. Retrying...';
+            statusLabel.style.color = '#ef4444';
+            setTimeout(() => {
+              this._startWirelessClient(roomCode, statusLabel);
+            }, 2500);
+          });
+        });
+
+        peer.on('error', (err) => {
+          this._log(`PeerJS client error: ${err.type}`);
+          if (err.type === 'peer-unavailable') {
+            statusLabel.textContent = `Host not found (Room ${roomCode}). Waiting...`;
+            statusLabel.style.color = '#f59e0b';
+            setTimeout(() => {
+              if (!this.isVerified) {
+                this._startWirelessClient(roomCode, statusLabel);
+              }
+            }, 3000);
+          } else {
+            statusLabel.textContent = `Error: ${err.type}`;
+            statusLabel.style.color = '#ef4444';
+          }
+        });
+
+      }).catch((err) => {
+        this._log(`Failed to load PeerJS: ${err.message}`);
+        statusLabel.textContent = 'CDN Failed. Check connection.';
+        statusLabel.style.color = '#ef4444';
+      });
+    }
     async _processManualOffer(offerBase64, answerTextArea, statusLabel) {
       if (this.peerConnection) return;
       statusLabel.textContent = 'Parsing manual offer...';
@@ -597,28 +568,20 @@ class TouchController {
   }
 
   _cleanupConnection() {
-      if (this._clientEventSourceLocal) {
-        try { this._clientEventSourceLocal.close(); } catch (e) {}
-        this._clientEventSourceLocal = null;
-      }
-      if (this._clientEventSourceFallback) {
-        try { this._clientEventSourceFallback.close(); } catch (e) {}
-        this._clientEventSourceFallback = null;
-      }
-      if (this.clientBeaconInterval) {
-        clearInterval(this.clientBeaconInterval);
-        this.clientBeaconInterval = null;
-      }
-      if (this.dataChannel) {
-        try { this.dataChannel.close(); } catch (e) {}
-        this.dataChannel = null;
-      }
-      if (this.peerConnection) {
-        try { this.peerConnection.close(); } catch (e) {}
-        this.peerConnection = null;
-      }
-      this.isVerified = false;
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
     }
+    if (this.dataChannel) {
+      try { this.dataChannel.close(); } catch (e) {}
+      this.dataChannel = null;
+    }
+    if (this.peerConnection) {
+      try { this.peerConnection.destroy(); } catch (e) {}
+      this.peerConnection = null;
+    }
+    this.isVerified = false;
+  }
   _startHeartbeat(channel, statusLabel) {
       if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
       this.lastHeartbeatTime = Date.now();
